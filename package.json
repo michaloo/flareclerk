@@ -1,0 +1,25 @@
+{
+  "name": "flareclerk",
+  "version": "0.1.0",
+  "description": "CLI reporting usage stats and cost estimates for Cloudflare compute and storage.",
+  "bin": {
+    "flareclerk": "./src/cli.js"
+  },
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "cloudflare",
+    "containers",
+    "workers",
+    "analytics",
+    "costs",
+    "monitoring"
+  ],
+  "dependencies": {
+    "commander": "^13.0.0",
+    "kleur": "^4.1.5"
+  }
+}
