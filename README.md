@@ -65,7 +65,7 @@ All commands support `--since <period>` (e.g. `7d`, `30d`, `2025-01-01`) and `--
 
 **What API permissions do I need?**
 
-Workers Scripts (read), Containers (read), R2 (read), D1 (read), Workers KV Storage (read), and Queues (read). The `flareclerk auth` command provides a pre-filled token creation link with all required permissions.
+Workers Scripts (read), Containers (read), Workers AI (read), R2 (read), D1 (read), Workers KV Storage (read), and Queues (read). The `flareclerk auth` command provides a pre-filled token creation link with all required permissions.
 
 **Where does the data come from?**
 

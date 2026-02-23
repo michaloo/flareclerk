@@ -17,6 +17,7 @@ export async function auth() {
       JSON.stringify([
         { key: "workers_scripts", type: "read" },
         { key: "containers", type: "read" },
+        { key: "workers_ai", type: "read" },
         { key: "workers_r2_storage", type: "read" },
         { key: "d1", type: "read" },
         { key: "workers_kv_storage", type: "read" },
@@ -26,7 +27,7 @@ export async function auth() {
     "&name=flareclerk";
 
   process.stderr.write(
-    "Create an API token with Workers Scripts, Containers, R2, D1, KV, and Queues (read) permissions.\n"
+    "Create an API token with Workers Scripts, Containers, Workers AI, R2, D1, KV, and Queues (read) permissions.\n"
   );
   process.stderr.write(`${fmt.url(tokenUrl)}\n\n`);
 
