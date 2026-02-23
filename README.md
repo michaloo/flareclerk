@@ -4,6 +4,8 @@ CLI reporting usage stats and cost estimates for Cloudflare compute and storage.
 
 Covers Workers (Durable Objects & Containers), Workers AI, R2, D1, KV, and Queues. No wrangler required.
 
+![flareclerk demo](flareclerk-demo.png)
+
 ## Install
 
 ```
