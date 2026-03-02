@@ -3,11 +3,14 @@ import {
   discoverWorker,
   listWorkerScripts,
   listContainerApps,
+  listD1Databases,
+  listKVNamespaces,
+  getWorkerSettings,
   cfApi,
   cfGraphQL,
 } from "../lib/cf.js";
 import { phase, status, fatal, fmt, table } from "../lib/output.js";
-import { parseDateRange, fmtCost, fmtUsage } from "../lib/cost-utils.js";
+import { parseDateRange, fmtCost, fmtUsage, fmtStorage, daysFraction } from "../lib/cost-utils.js";
 import kleur from "kleur";
 
 // --- Pricing (Workers Paid plan, $5/mo) ---
@@ -21,6 +24,12 @@ var PRICING = {
   containerMemGibSec: { included: 25 * 3600, rate: 0.0000025 },
   containerDiskGbSec: { included: 200 * 3600, rate: 0.00000007 },
   containerEgressGb: { included: 0, rate: 0.025 },
+  d1RowsRead: { included: 25_000_000_000, rate: 0.001 / 1_000_000 },
+  d1RowsWritten: { included: 50_000_000, rate: 1.00 / 1_000_000 },
+  d1StorageGb: { included: 5, rate: 0.75 },
+  kvReads: { included: 10_000_000, rate: 0.50 / 1_000_000 },
+  kvWrites: { included: 1_000_000, rate: 5.00 / 1_000_000 },
+  kvStorageGb: { included: 1, rate: 0.50 },
   platform: 5.0,
 };
 
@@ -33,6 +42,12 @@ var METRIC_KEYS = [
   "containerMemGibSec",
   "containerDiskGbSec",
   "containerEgressGb",
+  "d1RowsRead",
+  "d1RowsWritten",
+  "d1StorageGb",
+  "kvReads",
+  "kvWrites",
+  "kvStorageGb",
 ];
 
 // --- GraphQL query strings ---
@@ -83,6 +98,50 @@ var containersGQL = `query Containers($accountTag: string!, $filter: AccountCont
   }
 }`;
 
+var d1QueriesGQL = `query D1Queries($accountTag: string!, $filter: AccountD1QueriesAdaptiveGroupsFilter_InputObject!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      d1QueriesAdaptiveGroups(limit: 10000, filter: $filter) {
+        dimensions { databaseId }
+        sum { rowsRead rowsWritten }
+      }
+    }
+  }
+}`;
+
+var d1StorageGQL = `query D1Storage($accountTag: string!, $filter: AccountD1StorageAdaptiveGroupsFilter_InputObject!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      d1StorageAdaptiveGroups(limit: 10000, filter: $filter) {
+        dimensions { databaseId }
+        max { databaseSizeBytes }
+      }
+    }
+  }
+}`;
+
+var kvOpsGQL = `query KVOps($accountTag: string!, $filter: AccountKvOperationsAdaptiveGroupsFilter_InputObject!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      kvOperationsAdaptiveGroups(limit: 10000, filter: $filter) {
+        dimensions { namespaceId actionType }
+        sum { requests }
+      }
+    }
+  }
+}`;
+
+var kvStorageGQL = `query KVStorage($accountTag: string!, $filter: AccountKvStorageAdaptiveGroupsFilter_InputObject!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      kvStorageAdaptiveGroups(limit: 10000, filter: $filter) {
+        dimensions { namespaceId }
+        max { byteCount }
+      }
+    }
+  }
+}`;
+
 var containerLiveGQL = `query($accountTag: string!, $filter: AccountContainersMetricsAdaptiveGroupsFilter_InputObject!) {
   viewer {
     accounts(filter: { accountTag: $accountTag }) {
@@ -97,7 +156,7 @@ var containerLiveGQL = `query($accountTag: string!, $filter: AccountContainersMe
 // --- Fleet discovery ---
 
 async function discoverFleet(config) {
-  var [scripts, doNamespaces, containerApps] = await Promise.all([
+  var [scripts, doNamespaces, containerApps, d1Databases, kvNamespaces] = await Promise.all([
     listWorkerScripts(config),
     cfApi(
       "GET",
@@ -106,7 +165,22 @@ async function discoverFleet(config) {
       config.apiToken
     ).then((r) => r.result || []),
     listContainerApps(config),
+    listD1Databases(config),
+    listKVNamespaces(config),
   ]);
+
+  // Fetch settings for all workers to discover D1/KV bindings
+  var settingsMap = {};
+  await Promise.all(
+    scripts.map(async (s) => {
+      try {
+        var settings = await getWorkerSettings(config, s.id);
+        settingsMap[s.id] = settings?.bindings || [];
+      } catch {
+        settingsMap[s.id] = [];
+      }
+    })
+  );
 
   // Map script → namespaceIds
   var nsByScript = {};
@@ -138,10 +212,23 @@ async function discoverFleet(config) {
     // If no container, just use first namespace
     if (!namespaceId && nsIds.length > 0) namespaceId = nsIds[0];
 
+    // D1/KV bindings from worker settings
+    var bindings = settingsMap[s.id] || [];
+    var d1DatabaseIds = bindings
+      .filter((b) => b.type === "d1")
+      .map((b) => b.id)
+      .filter(Boolean);
+    var kvNamespaceIds = bindings
+      .filter((b) => b.type === "kv_namespace")
+      .map((b) => b.namespace_id)
+      .filter(Boolean);
+
     return {
       scriptName: s.id,
       namespaceId,
       containerAppId,
+      d1DatabaseIds,
+      kvNamespaceIds,
     };
   });
 
@@ -150,8 +237,8 @@ async function discoverFleet(config) {
 
 // --- Aggregate raw GraphQL results per worker ---
 
-function aggregateResults(workers, analytics) {
-  var { workersData, doReqData, doDurData, containersData } = analytics;
+function aggregateResults(workers, analytics, prorata) {
+  var { workersData, doReqData, doDurData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData } = analytics;
 
   var workerRows =
     workersData?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
@@ -207,6 +294,56 @@ function aggregateResults(workers, analytics) {
     containersByAppId[appId].txBytes += row.sum?.txBytes || 0;
   }
 
+  // D1 queries by databaseId
+  var d1QueryRows =
+    d1QueriesData?.viewer?.accounts?.[0]?.d1QueriesAdaptiveGroups || [];
+  var d1QueryByDb = {};
+  for (var row of d1QueryRows) {
+    var id = row.dimensions.databaseId;
+    if (!d1QueryByDb[id]) d1QueryByDb[id] = { rowsRead: 0, rowsWritten: 0 };
+    d1QueryByDb[id].rowsRead += row.sum?.rowsRead || 0;
+    d1QueryByDb[id].rowsWritten += row.sum?.rowsWritten || 0;
+  }
+
+  // D1 storage by databaseId (max bytes)
+  var d1StorageRows =
+    d1StorageData?.viewer?.accounts?.[0]?.d1StorageAdaptiveGroups || [];
+  var d1StorageByDb = {};
+  for (var row of d1StorageRows) {
+    var id = row.dimensions.databaseId;
+    var bytes = row.max?.databaseSizeBytes || 0;
+    if (!d1StorageByDb[id] || bytes > d1StorageByDb[id]) {
+      d1StorageByDb[id] = bytes;
+    }
+  }
+
+  // KV ops by namespaceId
+  var kvOpsRows =
+    kvOpsData?.viewer?.accounts?.[0]?.kvOperationsAdaptiveGroups || [];
+  var kvOpsByNs = {};
+  for (var row of kvOpsRows) {
+    var id = row.dimensions.namespaceId;
+    if (!kvOpsByNs[id]) kvOpsByNs[id] = { reads: 0, writes: 0 };
+    var reqs = row.sum?.requests || 0;
+    if (row.dimensions.actionType === "read") {
+      kvOpsByNs[id].reads += reqs;
+    } else {
+      kvOpsByNs[id].writes += reqs;
+    }
+  }
+
+  // KV storage by namespaceId (max bytes)
+  var kvStorageRows =
+    kvStorageData?.viewer?.accounts?.[0]?.kvStorageAdaptiveGroups || [];
+  var kvStorageByNs = {};
+  for (var row of kvStorageRows) {
+    var id = row.dimensions.namespaceId;
+    var bytes = row.max?.byteCount || 0;
+    if (!kvStorageByNs[id] || bytes > kvStorageByNs[id]) {
+      kvStorageByNs[id] = bytes;
+    }
+  }
+
   return workers.map((w) => {
     var scriptName = w.scriptName;
     var wd = workersByScript[scriptName] || { requests: 0, cpuMs: 0 };
@@ -226,8 +363,30 @@ function aggregateResults(workers, analytics) {
     var containerDiskGbSec = (c.allocatedDisk || 0) / 1_000_000_000;
     var containerEgressGb = (c.txBytes || 0) / 1_000_000_000;
 
+    // D1: sum across all bound databases
+    var d1RowsRead = 0, d1RowsWritten = 0, d1StorageBytes = 0;
+    for (var dbId of w.d1DatabaseIds || []) {
+      var dq = d1QueryByDb[dbId] || {};
+      d1RowsRead += dq.rowsRead || 0;
+      d1RowsWritten += dq.rowsWritten || 0;
+      d1StorageBytes = Math.max(d1StorageBytes, d1StorageByDb[dbId] || 0);
+    }
+    var d1StorageGb = (d1StorageBytes / 1_000_000_000) * prorata;
+
+    // KV: sum across all bound namespaces
+    var kvReads = 0, kvWrites = 0, kvStorageBytes = 0;
+    for (var kvNsId of w.kvNamespaceIds || []) {
+      var ko = kvOpsByNs[kvNsId] || {};
+      kvReads += ko.reads || 0;
+      kvWrites += ko.writes || 0;
+      kvStorageBytes = Math.max(kvStorageBytes, kvStorageByNs[kvNsId] || 0);
+    }
+    var kvStorageGb = (kvStorageBytes / 1_000_000_000) * prorata;
+
     return {
       name: scriptName,
+      d1StorageBytes,
+      kvStorageBytes,
       usage: {
         workerRequests: Math.round(wd.requests),
         workerCpuMs: Math.round(wd.cpuMs),
@@ -240,6 +399,12 @@ function aggregateResults(workers, analytics) {
         containerMemGibSec,
         containerDiskGbSec,
         containerEgressGb,
+        d1RowsRead,
+        d1RowsWritten,
+        d1StorageGb,
+        kvReads,
+        kvWrites,
+        kvStorageGb,
       },
     };
   });
@@ -261,6 +426,12 @@ function calculateAppCosts(usage) {
       usage.containerDiskGbSec * PRICING.containerDiskGbSec.rate,
     containerEgressGb:
       usage.containerEgressGb * PRICING.containerEgressGb.rate,
+    d1RowsRead: usage.d1RowsRead * PRICING.d1RowsRead.rate,
+    d1RowsWritten: usage.d1RowsWritten * PRICING.d1RowsWritten.rate,
+    d1StorageGb: usage.d1StorageGb * PRICING.d1StorageGb.rate,
+    kvReads: usage.kvReads * PRICING.kvReads.rate,
+    kvWrites: usage.kvWrites * PRICING.kvWrites.rate,
+    kvStorageGb: usage.kvStorageGb * PRICING.kvStorageGb.rate,
   };
 }
 
@@ -312,6 +483,14 @@ function applyFreeTier(appResults) {
       app.grossCosts.containerMemGibSec +
       app.grossCosts.containerDiskGbSec +
       app.grossCosts.containerEgressGb;
+    app.d1Cost =
+      app.grossCosts.d1RowsRead +
+      app.grossCosts.d1RowsWritten +
+      app.grossCosts.d1StorageGb;
+    app.kvCost =
+      app.grossCosts.kvReads +
+      app.grossCosts.kvWrites +
+      app.grossCosts.kvStorageGb;
   }
 
   return { appResults, freeTierDiscount, netFleetTotal, grossFleetTotal };
@@ -350,6 +529,8 @@ async function fetchAnalytics(config, workers, range) {
   var containerAppIds = workers
     .map((w) => w.containerAppId)
     .filter(Boolean);
+  var d1DatabaseIds = [...new Set(workers.flatMap((w) => w.d1DatabaseIds || []))];
+  var kvNamespaceIds = [...new Set(workers.flatMap((w) => w.kvNamespaceIds || []))];
 
   var queries = [];
 
@@ -401,9 +582,49 @@ async function fetchAnalytics(config, workers, range) {
     queries.push(Promise.resolve(null));
   }
 
-  var [workersData, doReqData, doDurData, containersData] =
+  // D1 queries
+  var dateFilter = {
+    date_geq: range.sinceDate,
+    date_leq: range.untilDate,
+  };
+  if (d1DatabaseIds.length > 0) {
+    queries.push(
+      cfGraphQL(config, d1QueriesGQL, {
+        accountTag: config.accountId,
+        filter: dateFilter,
+      })
+    );
+    queries.push(
+      cfGraphQL(config, d1StorageGQL, {
+        accountTag: config.accountId,
+        filter: dateFilter,
+      })
+    );
+  } else {
+    queries.push(Promise.resolve(null), Promise.resolve(null));
+  }
+
+  // KV queries
+  if (kvNamespaceIds.length > 0) {
+    queries.push(
+      cfGraphQL(config, kvOpsGQL, {
+        accountTag: config.accountId,
+        filter: dateFilter,
+      })
+    );
+    queries.push(
+      cfGraphQL(config, kvStorageGQL, {
+        accountTag: config.accountId,
+        filter: dateFilter,
+      })
+    );
+  } else {
+    queries.push(Promise.resolve(null), Promise.resolve(null));
+  }
+
+  var [workersData, doReqData, doDurData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData] =
     await Promise.all(queries);
-  return { workersData, doReqData, doDurData, containersData };
+  return { workersData, doReqData, doDurData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData };
 }
 
 // --- Fetch live container metrics ---
@@ -438,19 +659,21 @@ function renderFleet(fleet, range) {
   );
   console.log("");
 
-  var headers = ["NAME", "WORKERS", "DO", "CONTAINERS", "COST"];
+  var headers = ["NAME", "WORKERS", "DO", "CONTAINERS", "D1", "KV", "COST"];
   var rows = fleet.appResults.map((a) => [
     fmt.app(a.name),
     fmtCost(a.workersCost),
     fmtCost(a.doCost),
     fmtCost(a.containerCost),
+    fmtCost(a.d1Cost),
+    fmtCost(a.kvCost),
     fmtCost(a.grossTotal),
   ]);
 
   console.log(table(headers, rows));
   console.log("");
 
-  var labelW = 44;
+  var labelW = 60;
   console.log(
     "  " +
       fmt.dim("Subtotal".padEnd(labelW)) +
@@ -542,6 +765,36 @@ function renderSingleWorker(app, range) {
       fmtUsage(app.usage.containerEgressGb, "GB egress"),
       fmtCost(app.grossCosts.containerEgressGb),
     ],
+    [
+      "D1",
+      fmtUsage(app.usage.d1RowsRead, "rows read"),
+      fmtCost(app.grossCosts.d1RowsRead),
+    ],
+    [
+      "",
+      fmtUsage(app.usage.d1RowsWritten, "rows written"),
+      fmtCost(app.grossCosts.d1RowsWritten),
+    ],
+    [
+      "",
+      fmtStorage(app.d1StorageBytes) + " storage",
+      fmtCost(app.grossCosts.d1StorageGb),
+    ],
+    [
+      "KV",
+      fmtUsage(app.usage.kvReads, "reads"),
+      fmtCost(app.grossCosts.kvReads),
+    ],
+    [
+      "",
+      fmtUsage(app.usage.kvWrites, "writes"),
+      fmtCost(app.grossCosts.kvWrites),
+    ],
+    [
+      "",
+      fmtStorage(app.kvStorageBytes) + " storage",
+      fmtCost(app.grossCosts.kvStorageGb),
+    ],
   ];
 
   for (var row of rows.filter(Boolean)) {
@@ -593,6 +846,7 @@ function renderLiveContainers(containers) {
 export async function workers(name, options) {
   var config = getConfig();
   var range = parseDateRange(options.since);
+  var prorata = daysFraction(range);
 
   if (name) {
     // --- Detail mode ---
@@ -603,6 +857,23 @@ export async function workers(name, options) {
     } catch (e) {
       fatal(`Could not find worker ${fmt.app(name)}.`, e.message);
     }
+
+    // Discover D1/KV bindings from worker settings
+    try {
+      var settings = await getWorkerSettings(config, name);
+      var bindings = settings?.bindings || [];
+      worker.d1DatabaseIds = bindings
+        .filter((b) => b.type === "d1")
+        .map((b) => b.id)
+        .filter(Boolean);
+      worker.kvNamespaceIds = bindings
+        .filter((b) => b.type === "kv_namespace")
+        .map((b) => b.namespace_id)
+        .filter(Boolean);
+    } catch {
+      worker.d1DatabaseIds = [];
+      worker.kvNamespaceIds = [];
+    }
     status(`Worker: ${name}`);
 
     phase("Fetching analytics");
@@ -611,7 +882,7 @@ export async function workers(name, options) {
       fetchContainerMetrics(config, worker.containerAppId),
     ]);
 
-    var appResults = aggregateResults([worker], analytics);
+    var appResults = aggregateResults([worker], analytics, prorata);
     var fleet = applyFreeTier(appResults);
     var app = fleet.appResults[0];
 
@@ -702,7 +973,7 @@ export async function workers(name, options) {
     );
 
     var analytics = await fetchAnalytics(config, fleetWorkers, range);
-    var appResults = aggregateResults(fleetWorkers, analytics);
+    var appResults = aggregateResults(fleetWorkers, analytics, prorata);
     var fleet = applyFreeTier(appResults);
 
     if (options.json) {

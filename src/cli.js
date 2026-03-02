@@ -23,7 +23,7 @@ program
 
 program
   .command("workers [name]")
-  .description("Workers + DO + Containers usage and cost")
+  .description("Workers + DO + Containers + D1 + KV usage and cost")
   .option("--since <period>", "Date range: Nd (e.g. 7d) or YYYY-MM-DD (default: month to date)")
   .option("--json", "Output as JSON")
   .action(workers);
