@@ -1,6 +1,6 @@
 {
   "name": "flareclerk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "CLI reporting usage stats and cost estimates for Cloudflare compute and storage.",
   "bin": {
     "flareclerk": "./src/cli.js"
