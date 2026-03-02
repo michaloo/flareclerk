@@ -24,6 +24,12 @@ var PRICING = {
   containerMemGibSec: { included: 25 * 3600, rate: 0.0000025 },
   containerDiskGbSec: { included: 200 * 3600, rate: 0.00000007 },
   containerEgressGb: { included: 0, rate: 0.025 },
+  doStorageReadUnits: { included: 1_000_000, rate: 0.20 / 1_000_000 },
+  doStorageWriteUnits: { included: 1_000_000, rate: 1.00 / 1_000_000 },
+  doStorageDeletes: { included: 1_000_000, rate: 1.00 / 1_000_000 },
+  doSqlRowsRead: { included: 25_000_000_000, rate: 0.001 / 1_000_000 },
+  doSqlRowsWritten: { included: 50_000_000, rate: 1.00 / 1_000_000 },
+  doSqlStorageGb: { included: 5, rate: 0.20 },
   d1RowsRead: { included: 25_000_000_000, rate: 0.001 / 1_000_000 },
   d1RowsWritten: { included: 50_000_000, rate: 1.00 / 1_000_000 },
   d1StorageGb: { included: 5, rate: 0.75 },
@@ -42,6 +48,12 @@ var METRIC_KEYS = [
   "containerMemGibSec",
   "containerDiskGbSec",
   "containerEgressGb",
+  "doStorageReadUnits",
+  "doStorageWriteUnits",
+  "doStorageDeletes",
+  "doSqlRowsRead",
+  "doSqlRowsWritten",
+  "doSqlStorageGb",
   "d1RowsRead",
   "d1RowsWritten",
   "d1StorageGb",
@@ -81,7 +93,7 @@ var doDurationGQL = `query DODuration($accountTag: string!, $filter: DurableObje
     accounts(filter: { accountTag: $accountTag }) {
       durableObjectsPeriodicGroups(limit: 10000, filter: $filter) {
         dimensions { namespaceId }
-        sum { activeTime inboundWebsocketMsgCount }
+        sum { activeTime inboundWebsocketMsgCount storageReadUnits storageWriteUnits storageDeletes rowsRead rowsWritten }
       }
     }
   }
@@ -137,6 +149,27 @@ var kvStorageGQL = `query KVStorage($accountTag: string!, $filter: AccountKvStor
       kvStorageAdaptiveGroups(limit: 10000, filter: $filter) {
         dimensions { namespaceId }
         max { byteCount }
+      }
+    }
+  }
+}`;
+
+var doSqlStorageGQL = `query DOSqlStorage($accountTag: string!, $filter: AccountDurableObjectsSqlStorageGroupsFilter_InputObject!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      durableObjectsSqlStorageGroups(limit: 10000, filter: $filter) {
+        dimensions { namespaceId }
+        max { storedBytes }
+      }
+    }
+  }
+}`;
+
+var logsGQL = `query Logs($accountTag: string!, $filter: AccountLogExplorerIngestionAdaptiveGroupsFilter_InputObject!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      logExplorerIngestionAdaptiveGroups(limit: 10000, filter: $filter) {
+        sum { billableBytes }
       }
     }
   }
@@ -238,7 +271,7 @@ async function discoverFleet(config) {
 // --- Aggregate raw GraphQL results per worker ---
 
 function aggregateResults(workers, analytics, prorata) {
-  var { workersData, doReqData, doDurData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData } = analytics;
+  var { workersData, doReqData, doDurData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData, doSqlStorageData } = analytics;
 
   var workerRows =
     workersData?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
@@ -268,9 +301,14 @@ function aggregateResults(workers, analytics, prorata) {
   var doDurByNs = {};
   for (var row of doDurRows) {
     var ns = row.dimensions.namespaceId;
-    if (!doDurByNs[ns]) doDurByNs[ns] = { activeTime: 0, wsInbound: 0 };
+    if (!doDurByNs[ns]) doDurByNs[ns] = { activeTime: 0, wsInbound: 0, storageReadUnits: 0, storageWriteUnits: 0, storageDeletes: 0, rowsRead: 0, rowsWritten: 0 };
     doDurByNs[ns].activeTime += row.sum?.activeTime || 0;
     doDurByNs[ns].wsInbound += row.sum?.inboundWebsocketMsgCount || 0;
+    doDurByNs[ns].storageReadUnits += row.sum?.storageReadUnits || 0;
+    doDurByNs[ns].storageWriteUnits += row.sum?.storageWriteUnits || 0;
+    doDurByNs[ns].storageDeletes += row.sum?.storageDeletes || 0;
+    doDurByNs[ns].rowsRead += row.sum?.rowsRead || 0;
+    doDurByNs[ns].rowsWritten += row.sum?.rowsWritten || 0;
   }
 
   var containerRows =
@@ -344,6 +382,18 @@ function aggregateResults(workers, analytics, prorata) {
     }
   }
 
+  // DO SQL storage by namespaceId (max bytes)
+  var doSqlStorageRows =
+    doSqlStorageData?.viewer?.accounts?.[0]?.durableObjectsSqlStorageGroups || [];
+  var doSqlStorageByNs = {};
+  for (var row of doSqlStorageRows) {
+    var id = row.dimensions.namespaceId;
+    var bytes = row.max?.storedBytes || 0;
+    if (!doSqlStorageByNs[id] || bytes > doSqlStorageByNs[id]) {
+      doSqlStorageByNs[id] = bytes;
+    }
+  }
+
   return workers.map((w) => {
     var scriptName = w.scriptName;
     var wd = workersByScript[scriptName] || { requests: 0, cpuMs: 0 };
@@ -353,6 +403,17 @@ function aggregateResults(workers, analytics, prorata) {
     var doRequests =
       (nsId ? doReqByNs[nsId] || 0 : 0) +
       (doDuration.wsInbound || 0) / 20;
+
+    // DO KV storage ops
+    var doStorageReadUnits = doDuration.storageReadUnits || 0;
+    var doStorageWriteUnits = doDuration.storageWriteUnits || 0;
+    var doStorageDeletes = doDuration.storageDeletes || 0;
+
+    // DO SQL ops + storage
+    var doSqlRowsRead = doDuration.rowsRead || 0;
+    var doSqlRowsWritten = doDuration.rowsWritten || 0;
+    var doSqlStorageBytes = nsId ? doSqlStorageByNs[nsId] || 0 : 0;
+    var doSqlStorageGb = (doSqlStorageBytes / 1_000_000_000) * prorata;
 
     var c = w.containerAppId
       ? containersByAppId[w.containerAppId] || {}
@@ -387,6 +448,7 @@ function aggregateResults(workers, analytics, prorata) {
       name: scriptName,
       d1StorageBytes,
       kvStorageBytes,
+      doSqlStorageBytes,
       usage: {
         workerRequests: Math.round(wd.requests),
         workerCpuMs: Math.round(wd.cpuMs),
@@ -395,6 +457,12 @@ function aggregateResults(workers, analytics, prorata) {
         doGbSeconds: Math.round(
           ((doDuration.activeTime || 0) / 1_000_000) * (128 / 1024)
         ),
+        doStorageReadUnits,
+        doStorageWriteUnits,
+        doStorageDeletes,
+        doSqlRowsRead,
+        doSqlRowsWritten,
+        doSqlStorageGb,
         containerVcpuSec,
         containerMemGibSec,
         containerDiskGbSec,
@@ -426,6 +494,18 @@ function calculateAppCosts(usage) {
       usage.containerDiskGbSec * PRICING.containerDiskGbSec.rate,
     containerEgressGb:
       usage.containerEgressGb * PRICING.containerEgressGb.rate,
+    doStorageReadUnits:
+      usage.doStorageReadUnits * PRICING.doStorageReadUnits.rate,
+    doStorageWriteUnits:
+      usage.doStorageWriteUnits * PRICING.doStorageWriteUnits.rate,
+    doStorageDeletes:
+      usage.doStorageDeletes * PRICING.doStorageDeletes.rate,
+    doSqlRowsRead:
+      usage.doSqlRowsRead * PRICING.doSqlRowsRead.rate,
+    doSqlRowsWritten:
+      usage.doSqlRowsWritten * PRICING.doSqlRowsWritten.rate,
+    doSqlStorageGb:
+      usage.doSqlStorageGb * PRICING.doSqlStorageGb.rate,
     d1RowsRead: usage.d1RowsRead * PRICING.d1RowsRead.rate,
     d1RowsWritten: usage.d1RowsWritten * PRICING.d1RowsWritten.rate,
     d1StorageGb: usage.d1StorageGb * PRICING.d1StorageGb.rate,
@@ -477,7 +557,9 @@ function applyFreeTier(appResults) {
 
     app.workersCost =
       app.grossCosts.workerRequests + app.grossCosts.workerCpuMs;
-    app.doCost = app.grossCosts.doRequests + app.grossCosts.doGbSeconds;
+    app.doCost = app.grossCosts.doRequests + app.grossCosts.doGbSeconds +
+      app.grossCosts.doStorageReadUnits + app.grossCosts.doStorageWriteUnits + app.grossCosts.doStorageDeletes +
+      app.grossCosts.doSqlRowsRead + app.grossCosts.doSqlRowsWritten + app.grossCosts.doSqlStorageGb;
     app.containerCost =
       app.grossCosts.containerVcpuSec +
       app.grossCosts.containerMemGibSec +
@@ -567,6 +649,22 @@ async function fetchAnalytics(config, workers, range) {
     queries.push(Promise.resolve(null), Promise.resolve(null));
   }
 
+  // DO SQL storage bytes (by namespaceId)
+  if (namespaceIds.length > 0) {
+    queries.push(
+      cfGraphQL(config, doSqlStorageGQL, {
+        accountTag: config.accountId,
+        filter: {
+          datetimeHour_geq: range.sinceISO,
+          datetimeHour_leq: range.untilISO,
+          namespaceId_in: namespaceIds,
+        },
+      })
+    );
+  } else {
+    queries.push(Promise.resolve(null));
+  }
+
   if (containerAppIds.length > 0) {
     queries.push(
       cfGraphQL(config, containersGQL, {
@@ -622,9 +720,20 @@ async function fetchAnalytics(config, workers, range) {
     queries.push(Promise.resolve(null), Promise.resolve(null));
   }
 
-  var [workersData, doReqData, doDurData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData] =
+  // Observability logs (account-level)
+  queries.push(
+    cfGraphQL(config, logsGQL, {
+      accountTag: config.accountId,
+      filter: {
+        datetimeHour_geq: range.sinceISO,
+        datetimeHour_leq: range.untilISO,
+      },
+    }).catch(() => null)
+  );
+
+  var [workersData, doReqData, doDurData, doSqlStorageData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData, logsData] =
     await Promise.all(queries);
-  return { workersData, doReqData, doDurData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData };
+  return { workersData, doReqData, doDurData, doSqlStorageData, containersData, d1QueriesData, d1StorageData, kvOpsData, kvStorageData, logsData };
 }
 
 // --- Fetch live container metrics ---
@@ -652,7 +761,16 @@ async function fetchContainerMetrics(config, containerAppId) {
 
 // --- Render fleet ---
 
-function renderFleet(fleet, range) {
+function aggregateLogs(logsData) {
+  var rows = logsData?.viewer?.accounts?.[0]?.logExplorerIngestionAdaptiveGroups || [];
+  var billableBytes = 0;
+  for (var row of rows) {
+    billableBytes += row.sum?.billableBytes || 0;
+  }
+  return billableBytes;
+}
+
+function renderFleet(fleet, range, logsBillableBytes) {
   console.log("");
   console.log(
     `  ${fmt.bold("Workers estimated costs")} ${fmt.dim(`(${range.label})`)}`
@@ -684,6 +802,13 @@ function renderFleet(fleet, range) {
       "  " +
         fmt.dim("Free tier".padEnd(labelW)) +
         fmt.dim("-" + fmtCost(fleet.freeTierDiscount))
+    );
+  }
+  if (logsBillableBytes > 0) {
+    console.log(
+      "  " +
+        fmt.dim("Observability Logs".padEnd(labelW)) +
+        fmtStorage(logsBillableBytes)
     );
   }
   console.log(
@@ -744,6 +869,36 @@ function renderSingleWorker(app, range) {
       "",
       fmtUsage(app.usage.doGbSeconds, "GB-s"),
       fmtCost(app.grossCosts.doGbSeconds),
+    ],
+    [
+      "DO KV Storage",
+      fmtUsage(app.usage.doStorageReadUnits, "read units"),
+      fmtCost(app.grossCosts.doStorageReadUnits),
+    ],
+    [
+      "",
+      fmtUsage(app.usage.doStorageWriteUnits, "write units"),
+      fmtCost(app.grossCosts.doStorageWriteUnits),
+    ],
+    [
+      "",
+      fmtUsage(app.usage.doStorageDeletes, "deletes"),
+      fmtCost(app.grossCosts.doStorageDeletes),
+    ],
+    [
+      "DO SQL",
+      fmtUsage(app.usage.doSqlRowsRead, "rows read"),
+      fmtCost(app.grossCosts.doSqlRowsRead),
+    ],
+    [
+      "",
+      fmtUsage(app.usage.doSqlRowsWritten, "rows written"),
+      fmtCost(app.grossCosts.doSqlRowsWritten),
+    ],
+    [
+      "",
+      fmtStorage(app.doSqlStorageBytes) + " storage",
+      fmtCost(app.grossCosts.doSqlStorageGb),
     ],
     [
       "Containers",
@@ -975,6 +1130,7 @@ export async function workers(name, options) {
     var analytics = await fetchAnalytics(config, fleetWorkers, range);
     var appResults = aggregateResults(fleetWorkers, analytics, prorata);
     var fleet = applyFreeTier(appResults);
+    var logsBillableBytes = aggregateLogs(analytics.logsData);
 
     if (options.json) {
       console.log(
@@ -994,6 +1150,7 @@ export async function workers(name, options) {
             grossFleetTotal: fleet.grossFleetTotal,
             freeTierDiscount: fleet.freeTierDiscount,
             netFleetTotal: fleet.netFleetTotal,
+            logsBillableBytes,
             platform: PRICING.platform,
             total: fleet.netFleetTotal + PRICING.platform,
           },
@@ -1004,6 +1161,6 @@ export async function workers(name, options) {
       return;
     }
 
-    renderFleet(fleet, range);
+    renderFleet(fleet, range, logsBillableBytes);
   }
 }
